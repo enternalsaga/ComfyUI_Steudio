@@ -17,7 +17,8 @@ class Isolate:
                 "image":        ("IMAGE",),
                 "inpaint_mask": ("MASK",),
                 "ratio":        (list(RATIO_PRESETS.keys()),),
-                "Megapixel":    ("FLOAT", {"default": 1.00, "min": 0.10, "max": 8.00, "step": 0.01}),
+                # allow 0.00 as special value → compute MP from cropped area
+                "Megapixel":    ("FLOAT", {"default": 1.00, "min": 0.00, "max": 8.00, "step": 0.01}),
             },
             "optional": {
                 "context_mask": ("MASK",),
@@ -271,10 +272,19 @@ class Isolate:
             l, t, r, b = chosen_box
             if chosen_name in RATIO_PRESETS:
                 rw, rh = RATIO_PRESETS[chosen_name]
-                width, height, target_aspect = self._calculate_target_size_from_pair(rw, rh, Megapixel)
+                # if Megapixel == 0 → compute MP from cropped bbox area
+                mp_used = float(Megapixel)
+                if mp_used == 0.0:
+                    area_px = max(1, (r - l) * (b - t))
+                    mp_used = area_px / (1024.0 * 1024.0)
+                width, height, target_aspect = self._calculate_target_size_from_pair(rw, rh, mp_used)
                 final_ratio_used = chosen_name
             else:
-                width, height, target_aspect = self._calculate_target_size_for_aspect(chosen_aspect, Megapixel)
+                mp_used = float(Megapixel)
+                if mp_used == 0.0:
+                    area_px = max(1, (r - l) * (b - t))
+                    mp_used = area_px / (1024.0 * 1024.0)
+                width, height, target_aspect = self._calculate_target_size_for_aspect(chosen_aspect, mp_used)
                 final_ratio_used = f"custom({chosen_aspect:.6f})"
 
             # Strict aspect lock
@@ -295,7 +305,11 @@ class Isolate:
             # No ratio fits → full canvas
             l, t, r, b = 0, 0, W, H
             target_aspect = W / H if H > 0 else 1.0
-            width, height, _ = self._calculate_target_size_for_aspect(target_aspect, Megapixel)
+            mp_used = float(Megapixel)
+            if mp_used == 0.0:
+                area_px = max(1, (r - l) * (b - t))
+                mp_used = area_px / (1024.0 * 1024.0)
+            width, height, _ = self._calculate_target_size_for_aspect(target_aspect, mp_used)
             final_ratio_used = f"canvas({W}:{H})"
 
         # Crop and resize

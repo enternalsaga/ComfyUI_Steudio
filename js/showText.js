@@ -8,7 +8,8 @@ app.registerExtension({
         if (
             nodeData.name === "Ratio Calculator" ||
             nodeData.name === "Sequence Generator" ||
-            nodeData.name === "Display UI"
+            nodeData.name === "Display UI" ||
+            nodeData.name === "Get Latent Size"
         ) {
             function populate(text) {
                 // Clear existing widgets
