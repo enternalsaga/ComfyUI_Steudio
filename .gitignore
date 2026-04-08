@@ -1,0 +1,5 @@
+nodes/Utils/__pycache__/*
+/nodes/Divide and Conquer/__pycache__
+/nodes/Isolate and Dominate/__pycache__
+/__pycache__
+/.agents
