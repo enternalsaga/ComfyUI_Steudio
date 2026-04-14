@@ -22,6 +22,7 @@ class Tile_Grid_Picker:
                 "image": ("IMAGE",),
                 "dac_data": ("DAC_DATA",),
                 "selected_tiles": ("STRING", {"default": "[]"}),
+                "play_trigger": ("INT", {"default": 0}),
             },
             "hidden": {
                 "node_id": "UNIQUE_ID",
@@ -38,7 +39,7 @@ Click tiles in the preview to select/deselect.
 Shift+Click to select a range of tiles.
 Selected tiles are output as a list."""
 
-    def execute(self, image, dac_data, selected_tiles="[]", node_id=None):
+    def execute(self, image, dac_data, selected_tiles="[]", play_trigger=0, node_id=None):
         if isinstance(dac_data, list):
             dac_data = dac_data[0]
 
@@ -113,9 +114,10 @@ Selected tiles are output as a list."""
                 print(f"[TileGridPicker] Error saving preview: {e}")
                 preview_filename = None
 
-        # Enrich dac_data with selected_indices
+        # Enrich dac_data with selected_indices and original image
         enriched_dac_data = dict(dac_data)
         enriched_dac_data['selected_indices'] = selected_indices
+        enriched_dac_data['original_image'] = image
 
         # Build tile_info for frontend grid rendering
         tile_info = []

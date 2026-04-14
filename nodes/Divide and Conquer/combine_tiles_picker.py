@@ -20,7 +20,7 @@ class Combine_Tiles_Picker:
                 "dac_data": ("DAC_DATA",),
             },
             "optional": {
-                "original_image": ("IMAGE",),
+                "background_image": ("IMAGE",),
             }
         }
 
@@ -31,8 +31,8 @@ class Combine_Tiles_Picker:
     CATEGORY = "Steudio/Divide and Conquer"
     DESCRIPTION = """Combine processed tiles with original unselected tiles.
 Connect processed tiles from Tile Grid Picker pipeline.
-Connect original_image for unselected tile fallback.
-Original image is used as background canvas."""
+Defaults to original image as background (from dac_data).
+Connect background_image to override the background."""
 
     def _blend_tile(self, output, image_tile, x, y,
                     tile_width, tile_height,
@@ -58,7 +58,7 @@ Original image is used as background canvas."""
         output[:, y:y + tile_height, x:x + tile_width, :] *= (1 - mask_tensor)
         output[:, y:y + tile_height, x:x + tile_width, :] += image_tile * mask_tensor
 
-    def execute(self, images, dac_data, original_image=None):
+    def execute(self, images, dac_data, background_image=None):
         if isinstance(dac_data, list):
             dac_data = dac_data[0]
 
@@ -93,11 +93,13 @@ Original image is used as background canvas."""
             blend_x=blend_x, blend_y=blend_y,
         )
 
-        # Use original_image as background canvas
-        if original_image is not None:
-            if isinstance(original_image, list):
-                original_image = original_image[0]
-            output = original_image.clone()
+        # Background canvas: explicit input > original from dac_data > black
+        if background_image is not None:
+            if isinstance(background_image, list):
+                background_image = background_image[0]
+            output = background_image.clone()
+        elif dac_data.get('original_image') is not None:
+            output = dac_data['original_image'].clone()
         else:
             output = torch.zeros(
                 (1, upscaled_height, upscaled_width, 3), dtype=images.dtype

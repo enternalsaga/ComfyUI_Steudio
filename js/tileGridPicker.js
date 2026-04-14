@@ -1,4 +1,60 @@
 import { app } from "../../../scripts/app.js";
+import { api } from "../../../scripts/api.js";
+
+// ── Downstream node walking for Play button ──
+function getDownstreamNodes(startNode) {
+  const downstreamNodes = new Set();
+  function walkForward(node) {
+    if (downstreamNodes.has(node.id)) return;
+    downstreamNodes.add(node.id);
+    if (node.outputs) {
+      for (const output of node.outputs) {
+        if (output.links) {
+          for (const linkId of output.links) {
+            const link = app.graph.links[linkId];
+            if (link) {
+              const targetNode = app.graph._nodes_by_id?.[link.target_id];
+              if (targetNode) walkForward(targetNode);
+            }
+          }
+        }
+      }
+    }
+  }
+  walkForward(startNode);
+  return downstreamNodes;
+}
+
+function recursiveAddNodes(nodeId, oldOutput, newOutput) {
+  const currentNode = oldOutput[nodeId];
+  if (!currentNode || newOutput[nodeId]) return;
+  newOutput[nodeId] = currentNode;
+  if (currentNode.inputs) {
+    for (const inputValue of Object.values(currentNode.inputs)) {
+      if (Array.isArray(inputValue) && inputValue.length > 0) {
+        recursiveAddNodes(String(inputValue[0]), oldOutput, newOutput);
+      }
+    }
+  }
+}
+
+let tilePickerDownstreamNodeIds = null;
+
+const originalApiQueuePrompt = api.queuePrompt;
+api.queuePrompt = async function (index, prompt, ...args) {
+  if (tilePickerDownstreamNodeIds && prompt.output) {
+    const oldOutput = prompt.output;
+    const newOutput = {};
+    for (const nodeId of tilePickerDownstreamNodeIds) {
+      const nodeIdStr = String(nodeId);
+      if (oldOutput[nodeIdStr]) {
+        recursiveAddNodes(nodeIdStr, oldOutput, newOutput);
+      }
+    }
+    prompt.output = newOutput;
+  }
+  return originalApiQueuePrompt.apply(this, [index, prompt, ...args]);
+};
 
 app.registerExtension({
   name: "Steudio.TileGridPicker",
@@ -54,6 +110,13 @@ app.registerExtension({
         stWidget.computeSize = () => [0, -4];
       }
 
+      // Hide play_trigger widget
+      const ptWidget = this.getWidget("play_trigger");
+      if (ptWidget) {
+        ptWidget.hidden = true;
+        ptWidget.computeSize = () => [0, -4];
+      }
+
       // ── Toolbar: 3 buttons in 1 row ──
       const node = this;
       const TOOLBAR_BTNS = [
@@ -84,6 +147,24 @@ app.registerExtension({
             inv.forEach((i) => node.selectedTiles.add(i));
             node._syncWidgetFromSelection();
             node.setDirtyCanvas(true);
+          },
+        },
+        {
+          label: "Play",
+          action: async () => {
+            const ptW = node.getWidget("play_trigger");
+            if (ptW) {
+              ptW.value = (ptW.value + 1) % 1000;
+            }
+            const downstreamNodeIds = getDownstreamNodes(node);
+            if (downstreamNodeIds.size > 0) {
+              tilePickerDownstreamNodeIds = downstreamNodeIds;
+              try {
+                await app.queuePrompt(0);
+              } finally {
+                tilePickerDownstreamNodeIds = null;
+              }
+            }
           },
         },
       ];
@@ -173,7 +254,10 @@ app.registerExtension({
         );
         this.previewImage.onload = () => {
           this.previewLoaded = true;
-          this.size = this.computeSize();
+          // Only auto-size on first preview load; after that user controls size
+          if (!this._initialSizeSet) {
+            this.size = this.computeSize();
+          }
           this.setDirtyCanvas(true);
         };
         this.previewImage.onerror = () => {
@@ -259,34 +343,24 @@ app.registerExtension({
     };
 
     // ────────────────────────────────────────────
-    // computeSize
+    // computeSize — small minimum, user can freely resize
     // ────────────────────────────────────────────
     nodeType.prototype.computeSize = function () {
-      const minWidth = 360;
-      const maxWidth = 800;
-      const statusHeight = 30;
-      const padding = 20;
       const topOffset = this._getTopOffset();
+      // Minimum: just enough for toolbar + a small preview area
+      const minW = 150;
+      const minH = topOffset + 80;
 
-      let previewWidth = minWidth - padding * 2;
-      let previewHeight = 300;
-
-      if (this.previewLoaded && this.previewImage.naturalWidth) {
-        const aspect =
-          this.previewImage.naturalWidth / this.previewImage.naturalHeight;
-        previewWidth = Math.min(
-          maxWidth - padding * 2,
-          Math.max(minWidth - padding * 2, this.previewImage.naturalWidth)
-        );
-        previewHeight = previewWidth / aspect;
-        previewHeight = Math.max(200, Math.min(600, previewHeight));
-        previewWidth = previewHeight * aspect;
+      // On first preview load, suggest a reasonable initial size
+      if (this.previewLoaded && this.previewImage.naturalWidth && !this._initialSizeSet) {
+        const aspect = this.previewImage.naturalWidth / this.previewImage.naturalHeight;
+        const previewW = Math.min(400, this.previewImage.naturalWidth);
+        const previewH = previewW / aspect;
+        this._initialSizeSet = true;
+        return [previewW + 30, topOffset + previewH + 50];
       }
 
-      const totalWidth = Math.max(minWidth, previewWidth + padding * 2);
-      const totalHeight = topOffset + previewHeight + statusHeight + padding;
-
-      return [totalWidth, totalHeight];
+      return [minW, minH];
     };
 
     // ────────────────────────────────────────────
@@ -460,24 +534,6 @@ app.registerExtension({
             ctx.lineWidth = 2;
             ctx.setLineDash([]);
             ctx.strokeRect(tx + 1, ty + 1, tw - 2, th - 2);
-
-            // Checkmark badge (top-right corner)
-            const badgeSize = Math.min(20, tw * 0.25, th * 0.25);
-            const bx = tx + tw - badgeSize - 4;
-            const by = ty + 4;
-            ctx.fillStyle = COLORS.checkBg;
-            ctx.beginPath();
-            ctx.roundRect(bx, by, badgeSize, badgeSize, 3);
-            ctx.fill();
-
-            // Draw ✓
-            ctx.strokeStyle = COLORS.checkFg;
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.moveTo(bx + badgeSize * 0.2, by + badgeSize * 0.5);
-            ctx.lineTo(bx + badgeSize * 0.4, by + badgeSize * 0.75);
-            ctx.lineTo(bx + badgeSize * 0.8, by + badgeSize * 0.25);
-            ctx.stroke();
           }
 
           // Grid line (thin, always visible)
