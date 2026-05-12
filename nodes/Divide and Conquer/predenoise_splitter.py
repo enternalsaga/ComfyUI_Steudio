@@ -10,8 +10,8 @@
 #
 # Three modes:
 #   latent_interp  — lerp(original, upscaled) latents → crop tiles (fastest)
-#   two_phase      — global sample N steps on full latent → crop tiles
-#   combined       — interp first, then global sample, then crop tiles
+#   two_phase      — sample N steps on SMALL original latent → upscale latent → crop tiles
+#   combined       — sample on small latent → upscale → lerp with upscaled latent → crop tiles
 #
 # IMPORTANT for two_phase / combined:
 #   The downstream KSampler must use "add_noise = disable" (KSamplerAdvanced)
@@ -120,7 +120,7 @@ def _global_sample(model, latent: torch.Tensor, positive, negative,
                    steps: int, split_at_step: int,
                    cfg: float, seed: int) -> torch.Tensor:
     """
-    Run KSampler on the FULL latent for `split_at_step` steps only.
+    Run KSampler on a latent for `split_at_step` steps only.
     Uses comfy.sample.sample() — the same path as the standard KSampler node.
     Returns the partially-denoised latent tensor.
     """
@@ -147,6 +147,19 @@ def _global_sample(model, latent: torch.Tensor, positive, negative,
     return predenoised
 
 
+def _upscale_latent(latent: torch.Tensor, target_h: int, target_w: int,
+                    lf: int) -> torch.Tensor:
+    """
+    Upscale a latent tensor [1, C, h, w] to target pixel dimensions / lf.
+    Uses bicubic interpolation for smooth latent upscaling.
+    """
+    th = target_h // lf
+    tw = target_w // lf
+    return F.interpolate(
+        latent.float(), size=(th, tw), mode='bicubic', align_corners=False,
+    ).to(latent.dtype)
+
+
 # ---------------------------------------------------------------------------
 # Mode implementations
 # ---------------------------------------------------------------------------
@@ -165,40 +178,53 @@ def _mode_latent_interp(vae, upscaled_image, original_image,
     return _crop_latents(mixed, dac_data, lf)
 
 
-def _mode_two_phase(vae, model, upscaled_image, positive, negative,
+def _mode_two_phase(vae, model, original_image, positive, negative,
                     sampler_name, scheduler, steps, split_at_step,
                     cfg, seed, dac_data, lf) -> torch.Tensor:
     """
-    1. VAE encode full upscaled image.
-    2. Run global KSampler for split_at_step steps to establish coherent structure.
-    3. Crop the partially-denoised full latent into tile latents.
+    1. VAE encode the SMALL original image (native model resolution).
+    2. Run global KSampler for split_at_step steps on the small latent
+       → fast, low VRAM, correct base resolution for global structure.
+    3. Bicubic-upscale the predenoised latent to the upscaled canvas size.
+    4. Crop the upscaled latent into tile latents.
     start_at_step returned by node = split_at_step.
     DOWNSTREAM KSampler must use add_noise=disable (KSamplerAdvanced).
     """
-    full_latent = _encode_image(vae, upscaled_image)
-    predenoised = _global_sample(model, full_latent, positive, negative,
-                                 sampler_name, scheduler, steps, split_at_step,
-                                 cfg, seed)
-    return _crop_latents(predenoised, dac_data, lf)
+    small_latent = _encode_image(vae, original_image)
+    predenoised  = _global_sample(model, small_latent, positive, negative,
+                                  sampler_name, scheduler, steps, split_at_step,
+                                  cfg, seed)
+    upscaled_lat = _upscale_latent(
+        predenoised, dac_data['upscaled_height'], dac_data['upscaled_width'], lf,
+    )
+    return _crop_latents(upscaled_lat, dac_data, lf)
 
 
 def _mode_combined(vae, model, upscaled_image, original_image, alpha,
                    positive, negative, sampler_name, scheduler,
                    steps, split_at_step, cfg, seed, dac_data, lf) -> torch.Tensor:
     """
-    1. Lerp original + upscaled latents → mixed full latent (structural anchor).
-    2. Run global KSampler for split_at_step steps on the mixed latent.
-    3. Crop the result into tile latents.
+    1. VAE encode the SMALL original image.
+    2. Run global KSampler for split_at_step steps on small latent (structure).
+    3. Bicubic-upscale the predenoised latent to upscaled canvas size.
+    4. Lerp the upscaled predenoised latent with the upscaled_image's latent
+       using alpha → blends global structure with upscaled detail.
+    5. Crop into tile latents.
     start_at_step returned by node = split_at_step.
     DOWNSTREAM KSampler must use add_noise=disable (KSamplerAdvanced).
     """
-    lat_up      = _encode_image(vae, upscaled_image)
-    lat_orig    = _encode_resized_original(vae, original_image, dac_data)
-    full_mixed  = torch.lerp(lat_orig, lat_up, alpha)
-    predenoised = _global_sample(model, full_mixed, positive, negative,
-                                 sampler_name, scheduler, steps, split_at_step,
-                                 cfg, seed)
-    return _crop_latents(predenoised, dac_data, lf)
+    # Phase 1: sample on small original
+    small_latent = _encode_image(vae, original_image)
+    predenoised  = _global_sample(model, small_latent, positive, negative,
+                                  sampler_name, scheduler, steps, split_at_step,
+                                  cfg, seed)
+    upscaled_lat = _upscale_latent(
+        predenoised, dac_data['upscaled_height'], dac_data['upscaled_width'], lf,
+    )
+    # Phase 2: blend with upscaled image's latent for detail
+    lat_up = _encode_image(vae, upscaled_image)
+    mixed  = torch.lerp(upscaled_lat, lat_up, alpha)
+    return _crop_latents(mixed, dac_data, lf)
 
 
 # ---------------------------------------------------------------------------
@@ -216,9 +242,9 @@ class DaC_Predenoise_Splitter:
     Modes:
       latent_interp  → fastest; lerps original+upscaled latents before splitting.
                         Use standard KSampler with add_noise enabled.
-      two_phase      → global sample N steps on full latent then splits.
-                        Use KSamplerAdvanced with add_noise = 'disable'.
-      combined       → interp + global sample + split (maximum coherence).
+      two_phase      → sample N steps on SMALL original latent → upscale → split.
+                        Fast, low VRAM. Use KSamplerAdvanced with add_noise = 'disable'.
+      combined       → sample small → upscale → lerp with upscaled latent → split.
                         Use KSamplerAdvanced with add_noise = 'disable'.
     """
 
@@ -235,7 +261,7 @@ class DaC_Predenoise_Splitter:
                 ),
             },
             "optional": {
-                # ── latent_interp / combined ──────────────────────────────
+                # ── all modes need original_image ────────────────────────
                 "original_image": ("IMAGE",),
                 "interp_alpha": ("FLOAT", {
                     "default": 0.5,
@@ -320,16 +346,12 @@ class DaC_Predenoise_Splitter:
         lf = _get_latent_factor(vae)
 
         # ── validate mode requirements ────────────────────────────────────
-        needs_original = mode in ("latent_interp", "combined")
-        needs_model    = mode in ("two_phase",     "combined")
+        needs_model = mode in ("two_phase", "combined")
 
-        if needs_original and original_image is None:
-            print(
-                f"[DaC_Predenoise_Splitter] WARNING: mode='{mode}' requires "
-                "original_image. Falling back to 'two_phase'."
+        if original_image is None:
+            raise ValueError(
+                "[DaC_Predenoise_Splitter] original_image is required for all modes."
             )
-            mode = "two_phase"
-            needs_model = True
 
         if needs_model and (model is None or positive is None or negative is None):
             raise ValueError(
@@ -347,7 +369,7 @@ class DaC_Predenoise_Splitter:
 
         elif mode == "two_phase":
             tiles = _mode_two_phase(
-                vae, model, upscaled_image, positive, negative,
+                vae, model, original_image, positive, negative,
                 sampler_name, scheduler, steps, split_at_step,
                 cfg, seed, dac_data, lf,
             )
