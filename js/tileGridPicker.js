@@ -399,6 +399,9 @@ app.registerExtension({
 
     // ────────────────────────────────────────────
     // hitTestTile — which tile was clicked?
+    // Priority 1: label hot zone (center badge) — tiles buried under others
+    //             are still reachable by clicking their number label.
+    // Priority 2: topmost bounding box (last tile in list wins, as before).
     // ────────────────────────────────────────────
     nodeType.prototype._hitTestTile = function (localX, localY) {
       if (!this.tileInfo || !this.gridMeta) return null;
@@ -407,6 +410,32 @@ app.registerExtension({
       const scaleX = preview.width / this.gridMeta.image_width;
       const scaleY = preview.height / this.gridMeta.image_height;
 
+      // ── Pass 1: label hot zone (circle around tile center) ──
+      // Threshold scales with tile size so it feels natural at any zoom.
+      let closestLabelTile = null;
+      let closestLabelDist = Infinity;
+
+      for (const t of this.tileInfo) {
+        const tw = t.w * scaleX;
+        const th = t.h * scaleY;
+        const cx = t.x * scaleX + tw / 2;
+        const cy = t.y * scaleY + th / 2;
+
+        // Badge radius: ~25% of the shorter tile dimension, clamped 14–32px
+        const badgeR = Math.max(14, Math.min(32, Math.min(tw, th) * 0.25));
+        const dx = localX - cx;
+        const dy = localY - cy;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+
+        if (dist <= badgeR && dist < closestLabelDist) {
+          closestLabelDist = dist;
+          closestLabelTile = t.index;
+        }
+      }
+
+      if (closestLabelTile !== null) return closestLabelTile;
+
+      // ── Pass 2: topmost bounding box (last tile in array wins) ──
       for (let i = this.tileInfo.length - 1; i >= 0; i--) {
         const t = this.tileInfo[i];
         const tx = t.x * scaleX;
@@ -511,22 +540,33 @@ app.registerExtension({
       if (this.tileInfo && this.gridMeta) {
         const scaleX = preview.width / this.gridMeta.image_width;
         const scaleY = preview.height / this.gridMeta.image_height;
+        const hasSelection = this.selectedTiles.size > 0;
 
+        // ── Per-tile fill: light cyan on selected, very mild dim on unselected ──
+        for (const tile of this.tileInfo) {
+          const tx = preview.x + tile.x * scaleX;
+          const ty = preview.y + tile.y * scaleY;
+          const tw = tile.w * scaleX;
+          const th = tile.h * scaleY;
+          if (this.selectedTiles.has(tile.index)) {
+            ctx.fillStyle = COLORS.selectedFill;   // rgba(0, 229, 255, 0.12)
+          } else if (hasSelection) {
+            ctx.fillStyle = "rgba(0, 0, 0, 0.25)"; // mild dim for unselected only
+          } else {
+            continue;
+          }
+          ctx.fillRect(tx, ty, tw, th);
+        }
+
+        // ── Per-tile borders and labels ──
         for (const tile of this.tileInfo) {
           const tx = preview.x + tile.x * scaleX;
           const ty = preview.y + tile.y * scaleY;
           const tw = tile.w * scaleX;
           const th = tile.h * scaleY;
           const isSelected = this.selectedTiles.has(tile.index);
-          const hasSelection = this.selectedTiles.size > 0;
 
           ctx.save();
-
-          if (!isSelected && hasSelection) {
-            // Unselected: dark overlay 60% to dim
-            ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
-            ctx.fillRect(tx, ty, tw, th);
-          }
 
           if (isSelected) {
             // Selected: bright border
