@@ -2,24 +2,21 @@
 #
 # DaC_Predenoise_Splitter — Steudio / Divide and Conquer
 #
-# Anchors global image structure in latent space BEFORE the DaC pipeline
-# splits into per-tile processing, preventing content divergence at high
-# denoise (Flux.2 / SD).
+# Anchors global image structure in latent space BEFORE splitting into per-tile
+# latents, preventing content divergence at high denoise (Flux.2 / SD).
 #
 # Workflow position:
-#   DaC_Algorithm → [this node] → Divide_Image_Select → KSampler → Combine_Tiles
-#
-# This node outputs a FULL anchored IMAGE (not tiles). The existing DaC
-# pipeline (Divide_Image_Select) handles tile splitting downstream.
+#   DaC_Algorithm → [this node] → KSampler (start_at_step) → VAE Decode → Combine_Tiles
 #
 # Three modes:
-#   latent_interp  — lerp(original, upscaled) latents → decode back to image
-#   two_phase      — sample N steps on SMALL original latent → upscale → decode
-#   combined       — sample small → upscale → lerp with upscaled latent → decode
+#   latent_interp  — lerp(original, upscaled) latents → crop tiles (fastest)
+#   two_phase      — sample N steps on SMALL original latent → upscale latent → crop tiles
+#   combined       — sample on small latent → upscale → lerp with upscaled latent → crop tiles
 #
 # IMPORTANT for two_phase / combined:
-#   The downstream KSampler should use start_at_step from this node's output.
-#   For latent_interp, start_at_step = 0 (tile KSampler starts fresh).
+#   The downstream KSampler must use "add_noise = disable" (KSamplerAdvanced)
+#   because the returned tile_latents are already partially denoised.
+#   For latent_interp, use standard KSampler with noise enabled (start_at_step=0).
 
 import os
 import sys
@@ -28,6 +25,9 @@ import torch.nn.functional as F
 
 import comfy.sample
 import comfy.samplers
+
+sys.path.append(os.path.dirname(__file__))
+from _utils_ import create_tile_coordinates
 
 
 # ---------------------------------------------------------------------------
@@ -53,45 +53,66 @@ def _encode_image(vae, image: torch.Tensor) -> torch.Tensor:
     VAE-encode a BHWC float32 [0,1] image tensor.
     Handles both [H,W,C] and [B,H,W,C] inputs.
     Returns the raw latent tensor [1, C, H//lf, W//lf].
+    NOTE: vae.encode() returns a tensor, not a dict.
     """
     if image.ndim == 3:
-        image = image.unsqueeze(0)
-    return vae.encode(image[:, :, :, :3])
-
-
-def _decode_latent(vae, latent: torch.Tensor) -> torch.Tensor:
-    """
-    VAE-decode a latent tensor [1, C, H, W] back to BHWC image [1, H, W, C].
-    """
-    return vae.decode(latent)
-
-
-def _resize_image(image: torch.Tensor, target_h: int,
-                  target_w: int) -> torch.Tensor:
-    """
-    Resize a BHWC image tensor to target_h x target_w using bilinear.
-    """
-    img = image.unsqueeze(0) if image.ndim == 3 else image
-    resized = F.interpolate(
-        img.permute(0, 3, 1, 2).float(),
-        size=(target_h, target_w),
-        mode='bilinear',
-        align_corners=False,
-    ).permute(0, 2, 3, 1).clamp(0.0, 1.0)
-    return resized
+        image = image.unsqueeze(0)            # → [1, H, W, C]
+    return vae.encode(image[:, :, :, :3])     # drop alpha channel if present
 
 
 def _encode_resized_original(vae, original_image: torch.Tensor,
                               dac_data: dict) -> torch.Tensor:
     """
     Resize original_image to the upscaled canvas dimensions, then VAE-encode.
+    Keeps original_image in float32 [0,1] range throughout.
     """
-    resized = _resize_image(
-        original_image,
-        dac_data['upscaled_height'],
-        dac_data['upscaled_width'],
-    )
+    H_up = dac_data['upscaled_height']
+    W_up = dac_data['upscaled_width']
+
+    orig = original_image.unsqueeze(0) if original_image.ndim == 3 else original_image
+    # BHWC → BCHW for interpolate, then back
+    resized = F.interpolate(
+        orig.permute(0, 3, 1, 2).float(),
+        size=(H_up, W_up),
+        mode='bilinear',
+        align_corners=False,
+    ).permute(0, 2, 3, 1).clamp(0.0, 1.0)
+
     return _encode_image(vae, resized)
+
+
+def _crop_latents(latent_tensor: torch.Tensor, dac_data: dict,
+                  lf: int) -> list:
+    """
+    Crop a full latent [1, C, H, W] into a list of N tile latents,
+    each shaped [1, C, th//lf, tw//lf].
+    Returns a list (not a batch) so OUTPUT_IS_LIST can feed each tile
+    individually into the downstream per-tile KSampler loop.
+    """
+    tw_px = dac_data['tile_width']
+    th_px = dac_data['tile_height']
+    tw = tw_px // lf
+    th = th_px // lf
+
+    coords, _ = create_tile_coordinates(
+        dac_data['upscaled_width'],
+        dac_data['upscaled_height'],
+        tw_px, th_px,
+        dac_data['overlap_x'],
+        dac_data['overlap_y'],
+        dac_data['grid_x'],
+        dac_data['grid_y'],
+        dac_data['tile_order'],
+    )
+
+    _, C, H, W = latent_tensor.shape
+    tiles = []
+    for (x, y) in coords:
+        lx = min(x // lf, W - tw)
+        ly = min(y // lf, H - th)
+        tiles.append(latent_tensor[:, :, ly : ly + th, lx : lx + tw].clone())
+
+    return tiles   # list of [1, C, th, tw] tensors
 
 
 def _global_sample(model, latent: torch.Tensor, positive, negative,
@@ -100,9 +121,12 @@ def _global_sample(model, latent: torch.Tensor, positive, negative,
                    cfg: float, seed: int) -> torch.Tensor:
     """
     Run KSampler on a latent for `split_at_step` steps only.
+    Uses comfy.sample.sample() — the same path as the standard KSampler node.
     Returns the partially-denoised latent tensor.
     """
     noise = comfy.sample.prepare_noise(latent, seed)
+
+    # comfy.sample.sample returns a tensor (already moved to intermediate device)
     predenoised = comfy.sample.sample(
         model,
         noise,
@@ -137,19 +161,21 @@ def _upscale_latent(latent: torch.Tensor, target_h: int, target_w: int,
 
 
 # ---------------------------------------------------------------------------
-# Mode implementations — all return a full latent [1, C, H, W]
+# Mode implementations
 # ---------------------------------------------------------------------------
 
 def _mode_latent_interp(vae, upscaled_image, original_image,
-                         alpha, dac_data) -> torch.Tensor:
+                         alpha, dac_data, lf) -> torch.Tensor:
     """
-    Lerp original_latent → upscaled_latent by alpha.
+    Lerp original_latent → upscaled_latent by alpha, then crop into tile latents.
     alpha=0.0 → all original structure (safest).
     alpha=1.0 → all upscaled (same as no anchor).
+    start_at_step returned by node = 0  (tile KSampler starts fresh).
     """
     lat_up   = _encode_image(vae, upscaled_image)
     lat_orig = _encode_resized_original(vae, original_image, dac_data)
-    return torch.lerp(lat_orig, lat_up, alpha)
+    mixed    = torch.lerp(lat_orig, lat_up, alpha)
+    return _crop_latents(mixed, dac_data, lf)
 
 
 def _mode_two_phase(vae, model, original_image, positive, negative,
@@ -157,25 +183,12 @@ def _mode_two_phase(vae, model, original_image, positive, negative,
                     cfg, seed, dac_data, lf) -> torch.Tensor:
     """
     1. VAE encode the SMALL original image (native model resolution).
-    2. Run global KSampler for split_at_step steps on the small latent.
+    2. Run global KSampler for split_at_step steps on the small latent
+       → fast, low VRAM, correct base resolution for global structure.
     3. Bicubic-upscale the predenoised latent to the upscaled canvas size.
-    """
-    small_latent = _encode_image(vae, original_image)
-    predenoised  = _global_sample(model, small_latent, positive, negative,
-                                  sampler_name, scheduler, steps, split_at_step,
-                                  cfg, seed)
-    return _upscale_latent(
-        predenoised, dac_data['upscaled_height'], dac_data['upscaled_width'], lf,
-    )
-
-
-def _mode_combined(vae, model, upscaled_image, original_image, alpha,
-                   positive, negative, sampler_name, scheduler,
-                   steps, split_at_step, cfg, seed, dac_data, lf) -> torch.Tensor:
-    """
-    1. Sample on small original latent for split_at_step steps.
-    2. Upscale the predenoised latent to full canvas size.
-    3. Lerp with the upscaled_image's latent using alpha.
+    4. Crop the upscaled latent into tile latents.
+    start_at_step returned by node = split_at_step.
+    DOWNSTREAM KSampler must use add_noise=disable (KSamplerAdvanced).
     """
     small_latent = _encode_image(vae, original_image)
     predenoised  = _global_sample(model, small_latent, positive, negative,
@@ -184,8 +197,34 @@ def _mode_combined(vae, model, upscaled_image, original_image, alpha,
     upscaled_lat = _upscale_latent(
         predenoised, dac_data['upscaled_height'], dac_data['upscaled_width'], lf,
     )
+    return _crop_latents(upscaled_lat, dac_data, lf)
+
+
+def _mode_combined(vae, model, upscaled_image, original_image, alpha,
+                   positive, negative, sampler_name, scheduler,
+                   steps, split_at_step, cfg, seed, dac_data, lf) -> torch.Tensor:
+    """
+    1. VAE encode the SMALL original image.
+    2. Run global KSampler for split_at_step steps on small latent (structure).
+    3. Bicubic-upscale the predenoised latent to upscaled canvas size.
+    4. Lerp the upscaled predenoised latent with the upscaled_image's latent
+       using alpha → blends global structure with upscaled detail.
+    5. Crop into tile latents.
+    start_at_step returned by node = split_at_step.
+    DOWNSTREAM KSampler must use add_noise=disable (KSamplerAdvanced).
+    """
+    # Phase 1: sample on small original
+    small_latent = _encode_image(vae, original_image)
+    predenoised  = _global_sample(model, small_latent, positive, negative,
+                                  sampler_name, scheduler, steps, split_at_step,
+                                  cfg, seed)
+    upscaled_lat = _upscale_latent(
+        predenoised, dac_data['upscaled_height'], dac_data['upscaled_width'], lf,
+    )
+    # Phase 2: blend with upscaled image's latent for detail
     lat_up = _encode_image(vae, upscaled_image)
-    return torch.lerp(upscaled_lat, lat_up, alpha)
+    mixed  = torch.lerp(upscaled_lat, lat_up, alpha)
+    return _crop_latents(mixed, dac_data, lf)
 
 
 # ---------------------------------------------------------------------------
@@ -194,17 +233,19 @@ def _mode_combined(vae, model, upscaled_image, original_image, alpha,
 
 class DaC_Predenoise_Splitter:
     """
-    Anchors global image structure before the DaC pipeline splits into tiles.
-    Outputs a FULL IMAGE — the existing Divide_Image_Select handles tiling.
+    Insert between DaC_Algorithm and the per-tile KSampler to prevent tile
+    content divergence at high denoise settings.
 
     Workflow:
-        DaC_Algorithm ──► [this node] ──► Divide_Image_Select ──► KSampler ──► Combine
+        DaC_Algorithm ──► [this node] ──► KSampler ──► VAE Decode ──► Combine_Tiles
 
     Modes:
-      latent_interp  → fastest; lerps original+upscaled latents, decodes to image.
-      two_phase      → sample N steps on SMALL original latent → upscale → decode.
-                        Fast, low VRAM. Downstream KSampler: start_at_step from output.
-      combined       → sample small → upscale → lerp with upscaled → decode.
+      latent_interp  → fastest; lerps original+upscaled latents before splitting.
+                        Use standard KSampler with add_noise enabled.
+      two_phase      → sample N steps on SMALL original latent → upscale → split.
+                        Fast, low VRAM. Use KSamplerAdvanced with add_noise = 'disable'.
+      combined       → sample small → upscale → lerp with upscaled latent → split.
+                        Use KSamplerAdvanced with add_noise = 'disable'.
     """
 
     @classmethod
@@ -220,6 +261,7 @@ class DaC_Predenoise_Splitter:
                 ),
             },
             "optional": {
+                # ── all modes need original_image ────────────────────────
                 "original_image": ("IMAGE",),
                 "interp_alpha": ("FLOAT", {
                     "default": 0.5,
@@ -231,6 +273,7 @@ class DaC_Predenoise_Splitter:
                         "Lower values = stronger structural anchor."
                     ),
                 }),
+                # ── two_phase / combined ──────────────────────────────────
                 "model":    ("MODEL",),
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
@@ -271,14 +314,17 @@ class DaC_Predenoise_Splitter:
             },
         }
 
-    RETURN_TYPES  = ("IMAGE", "INT",           "DAC_DATA")
-    RETURN_NAMES  = ("IMAGE", "start_at_step", "dac_data")
-    FUNCTION      = "execute"
-    CATEGORY      = "Steudio/Divide and Conquer"
-    DESCRIPTION   = (
-        "Anchors global image structure before DaC tile splitting. "
-        "Outputs a full IMAGE (not tiles) — connect to Divide_Image_Select. "
-        "Prevents content drift / seams at high denoise (Flux.2)."
+    RETURN_TYPES   = ("LATENT", "INT",           "DAC_DATA")
+    RETURN_NAMES   = ("tile_latents", "start_at_step", "dac_data")
+    OUTPUT_IS_LIST = (True, False, False)
+    FUNCTION       = "execute"
+    CATEGORY       = "Steudio/Divide and Conquer"
+    DESCRIPTION    = (
+        "Anchors global image structure before splitting into per-tile latents. "
+        "Prevents content drift / seams at high denoise (Flux.2). "
+        "Replaces Divide_Image_Select + VAE Encode. "
+        "tile_latents is a LIST — ComfyUI loops each tile through downstream KSampler. "
+        "For two_phase / combined modes, set KSamplerAdvanced add_noise = 'disable'."
     )
 
     def execute(
@@ -301,29 +347,30 @@ class DaC_Predenoise_Splitter:
     ):
         lf = _get_latent_factor(vae)
 
-        # ── validate ──────────────────────────────────────────────────────
+        # ── validate mode requirements ────────────────────────────────────
+        needs_model = mode in ("two_phase", "combined")
+
         if original_image is None:
             raise ValueError(
                 "[DaC_Predenoise_Splitter] original_image is required for all modes."
             )
 
-        needs_model = mode in ("two_phase", "combined")
         if needs_model and (model is None or positive is None or negative is None):
             raise ValueError(
                 f"[DaC_Predenoise_Splitter] mode='{mode}' requires "
                 "model, positive, and negative inputs to be connected."
             )
 
-        # ── dispatch — each mode returns a full latent [1, C, H, W] ──────
+        # ── dispatch ──────────────────────────────────────────────────────
         if mode == "latent_interp":
-            full_latent = _mode_latent_interp(
+            tiles = _mode_latent_interp(
                 vae, upscaled_image, original_image,
-                interp_alpha, dac_data,
+                interp_alpha, dac_data, lf,
             )
             start = 0
 
         elif mode == "two_phase":
-            full_latent = _mode_two_phase(
+            tiles = _mode_two_phase(
                 vae, model, original_image, positive, negative,
                 sampler_name, scheduler, steps, split_at_step,
                 cfg, seed, dac_data, lf,
@@ -331,23 +378,24 @@ class DaC_Predenoise_Splitter:
             start = split_at_step
 
         else:   # combined
-            full_latent = _mode_combined(
+            tiles = _mode_combined(
                 vae, model, upscaled_image, original_image, interp_alpha,
                 positive, negative, sampler_name, scheduler,
                 steps, split_at_step, cfg, seed, dac_data, lf,
             )
             start = split_at_step
 
-        # ── decode back to IMAGE for downstream tile splitting ────────────
-        anchored_image = _decode_latent(vae, full_latent)
-
+        n = len(tiles)
+        th, tw = tiles[0].shape[-2], tiles[0].shape[-1]
         print(
             f"[DaC_Predenoise_Splitter] mode={mode} | "
-            f"output={anchored_image.shape[2]}x{anchored_image.shape[1]} | "
+            f"{n} tiles @ {th}x{tw} latent | "
             f"start_at_step={start}"
         )
 
-        return (anchored_image, start, dac_data)
+        # Wrap each tile tensor as a LATENT dict for ComfyUI
+        tile_latent_dicts = [{"samples": t} for t in tiles]
+        return (tile_latent_dicts, start, dac_data)
 
 
 # ---------------------------------------------------------------------------
