@@ -82,12 +82,12 @@ def _encode_resized_original(vae, original_image: torch.Tensor,
 
 
 def _crop_latents(latent_tensor: torch.Tensor, dac_data: dict,
-                  lf: int) -> list:
+                  lf: int) -> torch.Tensor:
     """
-    Crop a full latent [1, C, H, W] into a list of N tile latents,
-    each shaped [1, C, th//lf, tw//lf].
-    Returns a list (not a batch) so OUTPUT_IS_LIST can feed each tile
-    individually into the downstream per-tile KSampler loop.
+    Crop a full latent [1, C, H, W] into N tile latents [N, C, th//lf, tw//lf].
+    Tile pixel coordinates come from dac_data and are divided by the latent
+    factor (lf=8 for Flux.2/SD).  Edge tiles are already clamped by
+    create_tile_coordinates so they never exceed image boundaries.
     """
     tw_px = dac_data['tile_width']
     th_px = dac_data['tile_height']
@@ -110,9 +110,9 @@ def _crop_latents(latent_tensor: torch.Tensor, dac_data: dict,
     for (x, y) in coords:
         lx = min(x // lf, W - tw)
         ly = min(y // lf, H - th)
-        tiles.append(latent_tensor[:, :, ly : ly + th, lx : lx + tw].clone())
+        tiles.append(latent_tensor[:, :, ly : ly + th, lx : lx + tw])
 
-    return tiles   # list of [1, C, th, tw] tensors
+    return torch.cat(tiles, dim=0)   # [N_tiles, C, th, tw]
 
 
 def _global_sample(model, latent: torch.Tensor, positive, negative,
@@ -314,16 +314,14 @@ class DaC_Predenoise_Splitter:
             },
         }
 
-    RETURN_TYPES   = ("LATENT", "INT",           "DAC_DATA")
-    RETURN_NAMES   = ("tile_latents", "start_at_step", "dac_data")
-    OUTPUT_IS_LIST = (True, False, False)
-    FUNCTION       = "execute"
-    CATEGORY       = "Steudio/Divide and Conquer"
-    DESCRIPTION    = (
+    RETURN_TYPES  = ("LATENT", "INT",           "DAC_DATA")
+    RETURN_NAMES  = ("tile_latents", "start_at_step", "dac_data")
+    FUNCTION      = "execute"
+    CATEGORY      = "Steudio/Divide and Conquer"
+    DESCRIPTION   = (
         "Anchors global image structure before splitting into per-tile latents. "
         "Prevents content drift / seams at high denoise (Flux.2). "
-        "Replaces Divide_Image_Select + VAE Encode. "
-        "tile_latents is a LIST — ComfyUI loops each tile through downstream KSampler. "
+        "Connect tile_latents → KSampler(latent), start_at_step → KSampler(start_at_step). "
         "For two_phase / combined modes, set KSamplerAdvanced add_noise = 'disable'."
     )
 
@@ -385,17 +383,13 @@ class DaC_Predenoise_Splitter:
             )
             start = split_at_step
 
-        n = len(tiles)
-        th, tw = tiles[0].shape[-2], tiles[0].shape[-1]
         print(
             f"[DaC_Predenoise_Splitter] mode={mode} | "
-            f"{n} tiles @ {th}x{tw} latent | "
+            f"{tiles.shape[0]} tiles @ {tiles.shape[-2]}x{tiles.shape[-1]} latent | "
             f"start_at_step={start}"
         )
 
-        # Wrap each tile tensor as a LATENT dict for ComfyUI
-        tile_latent_dicts = [{"samples": t} for t in tiles]
-        return (tile_latent_dicts, start, dac_data)
+        return ({"samples": tiles}, start, dac_data)
 
 
 # ---------------------------------------------------------------------------
